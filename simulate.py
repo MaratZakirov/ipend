@@ -2,6 +2,7 @@ import pygame
 import math
 import sys
 import numpy as np
+from scipy.integrate import solve_ivp
 
 # Hyper parameters
 W, H = 800, 600
@@ -9,7 +10,9 @@ FPS = 60
 dt = 1/FPS
 m = 1
 M = 10
+g = 9.8
 p_length = 100
+l = p_length
 
 # Initial state (example values)
 # X | dX/dt | T | dT/dt
@@ -32,7 +35,7 @@ class Solution():
         self.l = l
         self.g = 9.8
 
-    def calc_dX(self, X):
+    def calc_dX(self, t, X):
         m, M, l, g = self.m, self.M, self.l, self.g
         D = lambda x: self.M + self.m*(np.sin(x)**2)
         # Set u to some non zero value
@@ -47,9 +50,11 @@ class Solution():
 
     def step(self, X: np.array):
         x, dx, theta, dtheta = X
-        L = 0.5*(self.M + self.m)*dx**2 + self.m*self.l*dx*dtheta*np.cos(theta) + 0.5*self.m*(self.l**2)*(dtheta**2) - self.m*self.g*self.l*np.cos(theta)
-        dX = self.calc_dX(X)
-        X = X + dX * dt
+        #L = 0.5*(self.M + self.m)*dx**2 + self.m*self.l*dx*dtheta*np.cos(theta) + 0.5*self.m*(self.l**2)*(dtheta**2) - self.m*self.g*self.l*np.cos(theta)
+        sol = solve_ivp(self.calc_dX, [dt, 2*dt], X, method='RK45')
+        X = sol.y[:, -1]
+        #Euler integration
+        #X = X + self.calc_dX(X) * dt
         return X
 
 class Stuff():
