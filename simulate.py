@@ -3,6 +3,7 @@ import math
 import sys
 import numpy as np
 from scipy.integrate import solve_ivp
+from scipy.linalg import solve_continuous_are
 
 # Hyper parameters
 W, H = 800, 600
@@ -28,19 +29,54 @@ screen = pygame.display.set_mode((W, H))
 pygame.display.set_caption("Inverted Pendulum Simulation")
 clock = pygame.time.Clock()
 
+class PID:
+    def __init__(self, Kp, Ki, Kd):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.integral = 0.0
+        self.prev_error = 0.0
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_error = 0.0
+
+    def step(self, error, dt):
+        self.integral += error * dt
+        derivative = (error - self.prev_error) / dt
+        self.prev_error = error
+        return self.Kp * error + self.Ki * self.integral + self.Kd * derivative
+
 class Solution():
-    def __init__(self, m, M, l):
+    def __init__(self, m, M, l, g):
         self.m = m
         self.M = M
         self.l = l
-        self.g = 9.8
+        self.g = g
+
+        # PID по углу: theta_ref = 0
+        self.pid = PID(Kp=200.0, Ki=0.0, Kd=20.0)  # подберите
+
+        # Внешний PID по позиции (медленный)
+        # self.pid_x = PID(Kp=1.0, Ki=0.0, Kd=0.5)
+
+        # Желаемая позиция тележки
+        # self.x_ref = 0.0
 
     def calc_dX(self, t, X):
         m, M, l, g = self.m, self.M, self.l, self.g
         D = lambda x: self.M + self.m*(np.sin(x)**2)
-        # Set u to some non zero value
-        u = 0
         x, dx, theta, dtheta = X
+
+        # ошибка: хотим theta = 0 (вертикально вверх)
+        theta_ref = 0.0
+        error = -theta_ref + theta
+
+        # PID управление (ограничим по величине, чтобы не «рвать» систему)
+        u_raw = self.pid.step(error, dt)
+        u_max = 50.0     # подберите
+        u = np.clip(u_raw, -u_max, u_max)
+
         dX = np.zeros(4)
         dX[0] = dx
         dX[2] = dtheta
@@ -84,7 +120,7 @@ class Stuff():
         self.draw_cart(screen, x, 0)
 
 stuff = Stuff()
-sol = Solution(m, M, p_length)
+sol = Solution(m, M, p_length, g)
 
 # --- Main simulation loop ---
 running = True
