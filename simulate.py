@@ -4,10 +4,11 @@ import sys
 import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.linalg import solve_continuous_are
+import matplotlib.pyplot as plt
 
 # Hyper parameters
 W, H = 800, 600
-FPS = 60
+FPS = 30
 dt = 1/FPS
 m = 1
 M = 10
@@ -17,8 +18,9 @@ l = p_length
 
 # Initial state (example values)
 # X | dX/dt | T | dT/dt
-X = np.zeros(4)
-X[2] += 0.1
+X = np.zeros(4)#, dtype=np.float32)
+X[2] -= 0.1
+X[0] += 70
 
 def transform(x: int, y: int):
     return x + W//2, 0.9*H - y
@@ -48,33 +50,37 @@ class PID:
         return self.Kp * error + self.Ki * self.integral + self.Kd * derivative
 
 class Solution():
-    def __init__(self, m, M, l, g):
+    def __init__(self, m, M, l, g,
+                 pid_params={'Kp' : 0, 'Ki' : 0, 'Kd' : 0},
+                 pid_x_params={'Kp' : 0, 'Ki' : 0, 'Kd' : 0}):
+        self.use_rk = True
         self.m = m
         self.M = M
         self.l = l
         self.g = g
 
         # PID по углу: theta_ref = 0
-        self.pid = PID(Kp=200.0, Ki=0.0, Kd=20.0)  # подберите
+        self.pid = PID(Kp=pid_params['Kp'], Ki=pid_params['Ki'], Kd=pid_params['Kd'])  # подберите
 
         # Внешний PID по позиции (медленный)
-        # self.pid_x = PID(Kp=1.0, Ki=0.0, Kd=0.5)
+        self.pid_x = PID(Kp=pid_x_params['Kp'], Ki=pid_x_params['Ki'], Kd=pid_x_params['Kd'])
 
         # Желаемая позиция тележки
-        # self.x_ref = 0.0
+        self.x_ref = 0.0
 
     def calc_dX(self, t, X):
         m, M, l, g = self.m, self.M, self.l, self.g
         D = lambda x: self.M + self.m*(np.sin(x)**2)
         x, dx, theta, dtheta = X
 
-        # ошибка: хотим theta = 0 (вертикально вверх)
-        theta_ref = 0.0
-        error = -theta_ref + theta
+        # --- Внешний контур: позиция -> желаемый угол ---
+        theta_ref_raw = self.pid_x.step(self.x_ref - x, dt)
+        theta_max = 0.2  # Максимальный безопасный угол
+        theta_ref = 0#np.tanh(theta_ref_raw / theta_max) * theta_max
 
         # PID управление (ограничим по величине, чтобы не «рвать» систему)
-        u_raw = self.pid.step(error, dt)
-        u_max = 50.0     # подберите
+        u_raw = self.pid.step(theta - theta_ref, dt)
+        u_max = 1150.0     # подберите
         u = np.clip(u_raw, -u_max, u_max)
 
         dX = np.zeros(4)
@@ -85,12 +91,17 @@ class Solution():
         return dX
 
     def step(self, X: np.array):
-        x, dx, theta, dtheta = X
-        #L = 0.5*(self.M + self.m)*dx**2 + self.m*self.l*dx*dtheta*np.cos(theta) + 0.5*self.m*(self.l**2)*(dtheta**2) - self.m*self.g*self.l*np.cos(theta)
-        sol = solve_ivp(self.calc_dX, [dt, 2*dt], X, method='RK45')
-        X = sol.y[:, -1]
-        #Euler integration
-        #X = X + self.calc_dX(X) * dt
+        # x, dx, theta, dtheta = X
+        # Lagrangian
+        # L = 0.5*(self.M + self.m)*dx**2 + self.m*self.l*dx*dtheta*np.cos(theta) + 0.5*self.m*(self.l**2)*(dtheta**2) - self.m*self.g*self.l*np.cos(theta)
+
+        # Use solver or Euler method
+        if self.use_rk:
+            sol = solve_ivp(self.calc_dX, [dt, 2*dt], X, method='RK45')
+            X = sol.y[:, -1] # get last value
+        else:
+            X = X + self.calc_dX(X) * dt
+
         return X
 
 class Stuff():
@@ -119,8 +130,30 @@ class Stuff():
         self.draw_pendulum(screen, x, 0, end_x, end_y)
         self.draw_cart(screen, x, 0)
 
+pid_params = {'Kp' : 4*1024, 'Ki' : 1, 'Kd' : 4*1024}
+# Ku = 120
+# Tu = 1700
+pid_x_params = {'Kp' : 0.001, 'Ki' : 0.000001, 'Kd' : 0.001}
+if 0:
+    data = []
+    stuff = Stuff()
+    sol = Solution(m, M, p_length, g, pid_params, pid_x_params)
+    for i in range(4000):
+        X = sol.step(X)
+        data.append(np.copy(X))
+        if i % 100 == 0:
+            print(i)
+    data = np.array(data)
+    plt.plot(data[:, 0])
+    #plt.scatter(x=np.arange(0, data.shape[0], 10), y=data[np.arange(0, data.shape[0], 10), 2], s=2)
+    plt.show()
+    exit()
+
+
 stuff = Stuff()
-sol = Solution(m, M, p_length, g)
+sol = Solution(m, M, p_length, g, pid_params)
+
+cnt = 0
 
 # --- Main simulation loop ---
 running = True
@@ -137,6 +170,10 @@ while running:
     screen.fill((255, 255, 255))
     stuff.draw(screen, X)
     X = sol.step(X)
+
+    cnt += 1
+    if cnt % FPS == 0:
+        print(cnt, f"Angle {X[2]:.2f}")
 
     # 4. Update the display
     pygame.display.flip()
