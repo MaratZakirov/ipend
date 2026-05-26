@@ -6,6 +6,7 @@ from scipy.integrate import solve_ivp
 from scipy.linalg import solve_continuous_are
 import matplotlib.pyplot as plt
 from pid import PID
+from dqn import OnlineRLController
 
 # Hyper parameters
 W, H = 800, 600
@@ -110,37 +111,81 @@ if __name__ == "__main__":
     # 2. Инициализируем PID-контроллеры внешним образом
     pid = PID(Kp=pid_params['Kp'], Ki=pid_params['Ki'], Kd=pid_params['Kd'])
     pid_x = PID(Kp=pid_x_params['Kp'], Ki=pid_x_params['Ki'], Kd=pid_x_params['Kd'])
-
     x_ref = 0.0
-    cnt = 0
 
+    # 3. Инициализируем RL-агент онлайн-обучения
+    # state_dim=4 (x, dx, theta, dtheta), action_dim=3 (влево, стоп, вправо)
+    rl_agent = OnlineRLController(state_dim=4, action_dim=3)
+    target_update_counter = 0
+
+    # Выбор режима: "PID" или "RL"
+    CONTROL_MODE = "RL"
+
+    cnt = 0
     running = True
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
 
+            # Интерактив: переключение режима по кнопке пробел
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_SPACE:
+                    CONTROL_MODE = "RL" if CONTROL_MODE == "PID" else "PID"
+                    print(f"--- РЕЖИМ ИЗМЕНЕН НА: {CONTROL_MODE} ---")
+
+        # --- СБОР ТЕКУЩЕГО СОСТОЯНИЯ ---
+        # Запоминаем текущее состояние перед шагом физики (нужно для RL)
+        current_state = np.copy(X)
+        x, dx, theta, dtheta = current_state
+
         # --- КОНТРОЛЛЕР (Внешний уровень управления) ---
-        x, dx, theta, dtheta = X
+        if CONTROL_MODE == "PID":
+            # Внешний контур PID: позиция тележки -> желаемый угол
+            theta_ref_raw = pid_x.step(x_ref - x, dt)
+            theta_max = 0.2
+            theta_ref = 0  # np.tanh(theta_ref_raw / theta_max) * theta_max
 
-        # Внешний контур: позиция тележки -> желаемый угол
-        theta_ref_raw = pid_x.step(x_ref - x, dt)
-        theta_max = 0.2
-        theta_ref = 0  # np.tanh(theta_ref_raw / theta_max) * theta_max
+            # Внутренний контур PID: угол -> необходимая сила u
+            u = pid.step(theta - theta_ref, dt)
 
-        # Внутренний контур: угол -> необходимая сила u
-        u = pid.step(theta - theta_ref, dt)
+        elif CONTROL_MODE == "RL":
+            # Нейросеть выбирает силу u на основе текущего состояния X
+            u = rl_agent.get_action(current_state)
 
         # --- ФИЗИКА (Передаем вычисленное u в движок) ---
         X = sol.step(X, u)
 
-        # Отрисовка
+        # --- ОНЛАЙН-ОБУЧЕНИЕ (Только в режиме RL) ---
+        if CONTROL_MODE == "RL":
+            # Передаем НОВОЕ состояние в агент для расчета награды и шага оптимизации сети
+            done, reward = rl_agent.train_step(X)
+
+            # Периодически синхронизируем Target-сеть DQN для стабильности
+            target_update_counter += 1
+            if target_update_counter % 10 == 0:
+                rl_agent.update_target_network()
+
+            # Если маятник упал или улетел за экран — сбрасываем среду
+            if done:
+                X = np.zeros(4)
+                X[2] -= 0.1  # Начальный небольшой наклон
+                X[0] += 70  # Смещение
+                rl_agent.last_state = None  # Сбрасываем историю шага агента
+                pid.reset()  # На всякий случай сбрасываем интеграторы PID
+                pid_x.reset()
+
+        # --- ОТРИСОВКА ---
         screen.fill((255, 255, 255))
         stuff.draw(screen, X)
 
+        # Вывод отладочной информации на экран
         cnt += 1
         if cnt % FPS == 0:
-            print(cnt, f"Angle {X[2]:.2f} | Control Force U: {u:.2f}")
+            info_str = f"Mode: {CONTROL_MODE} | Angle: {X[2]:.2f} | Force U: {u:.2f}"
+            if CONTROL_MODE == "RL":
+                info_str += f" | Eps: {rl_agent.epsilon:.2f} | Rew: {reward:.1f}"
+            print(info_str)
 
         pygame.display.flip()
         clock.tick(FPS)
