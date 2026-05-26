@@ -5,6 +5,7 @@ import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.linalg import solve_continuous_are
 import matplotlib.pyplot as plt
+from pid import PID
 
 # Hyper parameters
 W, H = 800, 600
@@ -18,7 +19,7 @@ l = p_length
 
 # Initial state (example values)
 # X | dX/dt | T | dT/dt
-X = np.zeros(4)#, dtype=np.float32)
+X = np.zeros(4)
 X[2] -= 0.1
 X[0] += 70
 
@@ -30,24 +31,6 @@ pygame.init()
 screen = pygame.display.set_mode((W, H))
 pygame.display.set_caption("Inverted Pendulum Simulation")
 clock = pygame.time.Clock()
-
-class PID:
-    def __init__(self, Kp, Ki, Kd):
-        self.Kp = Kp
-        self.Ki = Ki
-        self.Kd = Kd
-        self.integral = 0.0
-        self.prev_error = 0.0
-
-    def reset(self):
-        self.integral = 0.0
-        self.prev_error = 0.0
-
-    def step(self, error, dt):
-        self.integral += error * dt
-        derivative = (error - self.prev_error) / dt
-        self.prev_error = error
-        return self.Kp * error + self.Ki * self.integral + self.Kd * derivative
 
 class Solution():
     def __init__(self, m, M, l, g,
@@ -134,53 +117,39 @@ pid_params = {'Kp' : 4*1024, 'Ki' : 1, 'Kd' : 4*1024}
 # Ku = 120
 # Tu = 1700
 pid_x_params = {'Kp' : 0.001, 'Ki' : 0.000001, 'Kd' : 0.001}
-if 0:
-    data = []
+
+if __name__ == "__main__":
     stuff = Stuff()
-    sol = Solution(m, M, p_length, g, pid_params, pid_x_params)
-    for i in range(4000):
+    sol = Solution(m, M, p_length, g, pid_params)
+
+    cnt = 0
+
+    # --- Main simulation loop ---
+    running = True
+    while running:
+        # 1. Event Handling
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+        # 2. Game Logic and Physics Updates (Placeholder)
+        # Update cart_x and pendulum_angle based on physics equations.
+
+        # 3. Drawing
+        screen.fill((255, 255, 255))
+        stuff.draw(screen, X)
         X = sol.step(X)
-        data.append(np.copy(X))
-        if i % 100 == 0:
-            print(i)
-    data = np.array(data)
-    plt.plot(data[:, 0])
-    #plt.scatter(x=np.arange(0, data.shape[0], 10), y=data[np.arange(0, data.shape[0], 10), 2], s=2)
-    plt.show()
-    exit()
 
+        cnt += 1
+        if cnt % FPS == 0:
+            print(cnt, f"Angle {X[2]:.2f}")
 
-stuff = Stuff()
-sol = Solution(m, M, p_length, g, pid_params)
+        # 4. Update the display
+        pygame.display.flip()
 
-cnt = 0
+        # 5. Cap the frame rate
+        clock.tick(FPS)
 
-# --- Main simulation loop ---
-running = True
-while running:
-    # 1. Event Handling
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-
-    # 2. Game Logic and Physics Updates (Placeholder)
-    # Update cart_x and pendulum_angle based on physics equations.
-
-    # 3. Drawing
-    screen.fill((255, 255, 255))
-    stuff.draw(screen, X)
-    X = sol.step(X)
-
-    cnt += 1
-    if cnt % FPS == 0:
-        print(cnt, f"Angle {X[2]:.2f}")
-
-    # 4. Update the display
-    pygame.display.flip()
-
-    # 5. Cap the frame rate
-    clock.tick(FPS)
-
-# --- Quit Pygame ---
-pygame.quit()
-sys.exit()
+    # --- Quit Pygame ---
+    pygame.quit()
+    sys.exit()
