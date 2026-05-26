@@ -33,59 +33,42 @@ pygame.display.set_caption("Inverted Pendulum Simulation")
 clock = pygame.time.Clock()
 
 class Solution():
-    def __init__(self, m, M, l, g,
-                 pid_params={'Kp' : 0, 'Ki' : 0, 'Kd' : 0},
-                 pid_x_params={'Kp' : 0, 'Ki' : 0, 'Kd' : 0}):
+    def __init__(self, m, M, l, g):
         self.use_rk = True
         self.m = m
         self.M = M
         self.l = l
         self.g = g
 
-        # PID по углу: theta_ref = 0
-        self.pid = PID(Kp=pid_params['Kp'], Ki=pid_params['Ki'], Kd=pid_params['Kd'])  # подберите
-
-        # Внешний PID по позиции (медленный)
-        self.pid_x = PID(Kp=pid_x_params['Kp'], Ki=pid_x_params['Ki'], Kd=pid_x_params['Kd'])
-
-        # Желаемая позиция тележки
-        self.x_ref = 0.0
-
-    def calc_dX(self, t, X):
+    def calc_dX(self, t, X, u):
+        """Чистая физика: вычисляет dX на основе текущего состояния X и внешней силы u"""
         m, M, l, g = self.m, self.M, self.l, self.g
-        D = lambda x: self.M + self.m*(np.sin(x)**2)
+        D = lambda x: M + m * (np.sin(x)**2)
         x, dx, theta, dtheta = X
 
-        # --- Внешний контур: позиция -> желаемый угол ---
-        theta_ref_raw = self.pid_x.step(self.x_ref - x, dt)
-        theta_max = 0.2  # Максимальный безопасный угол
-        theta_ref = 0#np.tanh(theta_ref_raw / theta_max) * theta_max
-
-        # PID управление (ограничим по величине, чтобы не «рвать» систему)
-        u_raw = self.pid.step(theta - theta_ref, dt)
-        u_max = 1150.0     # подберите
-        u = np.clip(u_raw, -u_max, u_max)
+        # Ограничение силы (чтобы не рвать систему)
+        u_max = 1150.0
+        u = np.clip(u, -u_max, u_max)
 
         dX = np.zeros(4)
         dX[0] = dx
         dX[2] = dtheta
-        dX[1] = (u + m*l*np.sin(X[2])*X[3]**2 - m*g*np.sin(X[2])*np.cos(X[2])) / D(X[2])
-        dX[3] = (-u*np.cos(X[2]) - m*l*np.sin(X[2])*np.cos(X[2])*X[3]**2 + (M+m)*g*np.sin(X[2])) / (l*D(X[2]))
+        dX[1] = (u + m*l*np.sin(theta)*dtheta**2 - m*g*np.sin(theta)*np.cos(theta)) / D(theta)
+        dX[3] = (-u*np.cos(theta) - m*l*np.sin(theta)*np.cos(theta)*dtheta**2 + (M+m)*g*np.sin(theta)) / (l*D(theta))
         return dX
 
-    def step(self, X: np.array):
-        # x, dx, theta, dtheta = X
-        # Lagrangian
-        # L = 0.5*(self.M + self.m)*dx**2 + self.m*self.l*dx*dtheta*np.cos(theta) + 0.5*self.m*(self.l**2)*(dtheta**2) - self.m*self.g*self.l*np.cos(theta)
-
-        # Use solver or Euler method
+    def step(self, X: np.array, u: float):
+        """Делает шаг симуляции вперед во времени, используя силу управления u"""
         if self.use_rk:
-            sol = solve_ivp(self.calc_dX, [dt, 2*dt], X, method='RK45')
-            X = sol.y[:, -1] # get last value
+            # Передаем u через аргумент args в solve_ivp
+            sol = solve_ivp(self.calc_dX, [0, dt], X, args=(u,), method='RK45')
+            X = sol.y[:, -1]
         else:
-            X = X + self.calc_dX(X) * dt
+            # Для метода Эйлера t передаем как 0
+            X = X + self.calc_dX(0, X, u) * dt
 
         return X
+
 
 class Stuff():
     def __init__(self):
@@ -120,36 +103,47 @@ pid_x_params = {'Kp' : 0.001, 'Ki' : 0.000001, 'Kd' : 0.001}
 
 if __name__ == "__main__":
     stuff = Stuff()
-    sol = Solution(m, M, p_length, g, pid_params)
 
+    # 1. Инициализируем чистый физический движок
+    sol = Solution(m, M, p_length, g)
+
+    # 2. Инициализируем PID-контроллеры внешним образом
+    pid = PID(Kp=pid_params['Kp'], Ki=pid_params['Ki'], Kd=pid_params['Kd'])
+    pid_x = PID(Kp=pid_x_params['Kp'], Ki=pid_x_params['Ki'], Kd=pid_x_params['Kd'])
+
+    x_ref = 0.0
     cnt = 0
 
-    # --- Main simulation loop ---
     running = True
     while running:
-        # 1. Event Handling
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
 
-        # 2. Game Logic and Physics Updates (Placeholder)
-        # Update cart_x and pendulum_angle based on physics equations.
+        # --- КОНТРОЛЛЕР (Внешний уровень управления) ---
+        x, dx, theta, dtheta = X
 
-        # 3. Drawing
+        # Внешний контур: позиция тележки -> желаемый угол
+        theta_ref_raw = pid_x.step(x_ref - x, dt)
+        theta_max = 0.2
+        theta_ref = 0  # np.tanh(theta_ref_raw / theta_max) * theta_max
+
+        # Внутренний контур: угол -> необходимая сила u
+        u = pid.step(theta - theta_ref, dt)
+
+        # --- ФИЗИКА (Передаем вычисленное u в движок) ---
+        X = sol.step(X, u)
+
+        # Отрисовка
         screen.fill((255, 255, 255))
         stuff.draw(screen, X)
-        X = sol.step(X)
 
         cnt += 1
         if cnt % FPS == 0:
-            print(cnt, f"Angle {X[2]:.2f}")
+            print(cnt, f"Angle {X[2]:.2f} | Control Force U: {u:.2f}")
 
-        # 4. Update the display
         pygame.display.flip()
-
-        # 5. Cap the frame rate
         clock.tick(FPS)
 
-    # --- Quit Pygame ---
     pygame.quit()
     sys.exit()
