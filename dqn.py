@@ -24,7 +24,7 @@ class QNetwork(nn.Module):
 
 # --- Класс RL Управления с онлайн-обучением ---
 class OnlineRLController:
-    def __init__(self, state_dim=4, action_dim=3, lr=0.001, gamma=0.99):
+    def __init__(self, state_dim=4, action_dim=7, lr=0.001, gamma=0.99):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Модели: текущая и целевая (для стабильности DQN)
@@ -36,11 +36,11 @@ class OnlineRLController:
         self.memory = deque(maxlen=10000)  # Буфер памяти реплеев
 
         # Дискретные действия: [Сила влево, Ноль, Сила вправо]
-        self.action_space = [-50.0, 0.0, 50.0]
+        self.action_space = [-200, -100.0, -50.0, 0.0, 50.0, 100.0, 200.0]
 
         # Гиперпараметры исследования (Epsilon-greedy)
         self.epsilon = 1.0
-        self.epsilon_decay = 0.995
+        self.epsilon_decay = 0.999995
         self.epsilon_min = 0.05
         self.gamma = gamma
         self.batch_size = 32

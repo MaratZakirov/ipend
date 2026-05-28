@@ -7,6 +7,7 @@ from scipy.linalg import solve_continuous_are
 import matplotlib.pyplot as plt
 from pid import PID
 from dqn import OnlineRLController
+import copy
 
 # Hyper parameters
 W, H = 800, 600
@@ -102,6 +103,72 @@ pid_params = {'Kp' : 4*1024, 'Ki' : 1, 'Kd' : 4*1024}
 # Tu = 1700
 pid_x_params = {'Kp' : 0.001, 'Ki' : 0.000001, 'Kd' : 0.001}
 
+
+def pretrain_agent(agent, solution, steps=1500000):
+    print("Запуск стабильного фонового обучения...")
+
+    def get_random_state():
+        state = np.zeros(4)
+        state[0] = np.random.uniform(-150.0, 150.0)
+        state[1] = np.random.uniform(-10.0, 10.0)
+        state[2] = np.random.uniform(-0.3, 0.3)
+        state[3] = np.random.uniform(-0.3, 0.3)
+        return state
+
+    episode_lengths = []
+    current_ep_steps = 0
+    state = get_random_state()
+
+    # Переменные для сохранения лучшей модели
+    best_time = 0.0
+    best_model_weights = None
+
+    for step in range(steps):
+        action_u = agent.get_action(state)
+        next_state = solution.step(state, action_u)
+        done, _ = agent.train_step(next_state)
+
+        current_ep_steps += 1
+
+        # ИСПРАВЛЕНИЕ: Обновляем Target-сеть значительно реже (раз в 1000 шагов)
+        if step % 1000 == 0:
+            agent.update_target_network()
+
+        if done:
+            episode_lengths.append(current_ep_steps)
+            if len(episode_lengths) > 20:
+                episode_lengths.pop(0)
+
+            # Проверяем, побит ли рекорд выживания (по скользящему среднему)
+            avg_len_s = np.mean(episode_lengths) * dt
+            if avg_len_s > best_time and len(episode_lengths) == 20:
+                best_time = avg_len_s
+                # Сохраняем слепок весов лучшей сети
+                best_model_weights = copy.deepcopy(agent.policy_net.state_dict())
+                print(f"!!! Новый рекорд удержания: {best_time:.2f} сек. Веса сохранены в буфер. !!!")
+
+            state = get_random_state()
+            agent.last_state = None
+            current_ep_steps = 0
+        else:
+            state = next_state
+
+        if step % 10000 == 0:
+            avg_len = np.mean(episode_lengths) if episode_lengths else 0.0
+            print(f"Step: {step:6d}/{steps} | "
+                  f"Avg Ep Length: {avg_len:5.1f} steps ({avg_len * dt:4.2f}s) | "
+                  f"Best Time: {best_time:.2f}s | "
+                  f"Epsilon: {agent.epsilon:.3f}")
+
+    # Восстанавливаем лучшую модель, если она была найдена
+    if best_model_weights is not None:
+        agent.policy_net.load_state_dict(best_model_weights)
+        agent.target_net.load_state_dict(best_model_weights)
+        print(f"Обучение завершено. Восстановлена лучшая модель с результатом {best_time:.2f} сек.")
+    else:
+        print("Обучение завершено.")
+
+
 if __name__ == "__main__":
     stuff = Stuff()
 
@@ -115,11 +182,17 @@ if __name__ == "__main__":
 
     # 3. Инициализируем RL-агент онлайн-обучения
     # state_dim=4 (x, dx, theta, dtheta), action_dim=3 (влево, стоп, вправо)
-    rl_agent = OnlineRLController(state_dim=4, action_dim=3)
+    rl_agent = OnlineRLController(state_dim=4)
     target_update_counter = 0
 
     # Выбор режима: "PID" или "RL"
     CONTROL_MODE = "RL"
+
+    pretrain_agent(rl_agent, sol)
+
+    # Выставляем начальные условия
+    X[2] -= 0.1  # Начальный небольшой наклон
+    X[0] += 70  # Смещение
 
     cnt = 0
     running = True
