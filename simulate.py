@@ -6,8 +6,10 @@ from scipy.integrate import solve_ivp
 from scipy.linalg import solve_continuous_are
 import matplotlib.pyplot as plt
 from pid import PID
-from dqn import OnlineRLController
+from ppo import OnlineRLController
 import copy
+import torch
+
 
 # Hyper parameters
 W, H = 800, 600
@@ -103,70 +105,58 @@ pid_params = {'Kp' : 4*1024, 'Ki' : 1, 'Kd' : 4*1024}
 # Tu = 1700
 pid_x_params = {'Kp' : 0.001, 'Ki' : 0.000001, 'Kd' : 0.001}
 
+def get_random_state():
+    S_0 = np.array([np.random.uniform(-150.0, 150.0),
+                    np.random.uniform(-10.0, 10.0),
+                    np.random.uniform(-0.3, 0.3),
+                    np.random.uniform(-0.3, 0.3)])
+    return S_0
 
-def pretrain_agent(agent, solution, steps=1500000):
-    print("Запуск стабильного фонового обучения...")
+# for training policy
+def pretrain_agent_one_batch(agent, solution, batch_size: int=32):
+    batch_weights = []
+    episode_lengths = []  # --- ТЕПЕРЬ СЛЕДИМ ЗА ДЛИНОЙ РАУНДОВ ---
 
-    def get_random_state():
-        state = np.zeros(4)
-        state[0] = np.random.uniform(-150.0, 150.0)
-        state[1] = np.random.uniform(-10.0, 10.0)
-        state[2] = np.random.uniform(-0.3, 0.3)
-        state[3] = np.random.uniform(-0.3, 0.3)
-        return state
+    S_t, done, states, actions, episode_rewards = get_random_state(), False, [], [], []
 
-    episode_lengths = []
-    current_ep_steps = 0
-    state = get_random_state()
+    while True:
+        states.append(S_t)
 
-    # Переменные для сохранения лучшей модели
-    best_time = 0.0
-    best_model_weights = None
+        a_t = agent.get_action(torch.as_tensor(S_t, dtype=torch.float32).to(agent.device))
+        actions.append(a_t)
 
-    for step in range(steps):
-        action_u = agent.get_action(state)
-        next_state = solution.step(state, action_u)
-        done, _ = agent.train_step(next_state)
-
-        current_ep_steps += 1
-
-        # ИСПРАВЛЕНИЕ: Обновляем Target-сеть значительно реже (раз в 1000 шагов)
-        if step % 1000 == 0:
-            agent.update_target_network()
+        S_t = solution.step(S_t, a_t)
+        r_t, done = agent.compute_reward(S_t)
+        episode_rewards.append(r_t)
 
         if done:
-            episode_lengths.append(current_ep_steps)
-            if len(episode_lengths) > 20:
-                episode_lengths.pop(0)
+            # Длина этого раунда — это просто количество шагов в episode_rewards
+            episode_lengths.append(len(episode_rewards))
 
-            # Проверяем, побит ли рекорд выживания (по скользящему среднему)
-            avg_len_s = np.mean(episode_lengths) * dt
-            if avg_len_s > best_time and len(episode_lengths) == 20:
-                best_time = avg_len_s
-                # Сохраняем слепок весов лучшей сети
-                best_model_weights = copy.deepcopy(agent.policy_net.state_dict())
-                print(f"!!! Новый рекорд удержания: {best_time:.2f} сек. Веса сохранены в буфер. !!!")
+            R = np.array(episode_rewards)
+            batch_weights += (R.sum() + R - np.cumsum(R)).tolist()
 
-            state = get_random_state()
-            agent.last_state = None
-            current_ep_steps = 0
-        else:
-            state = next_state
+            if len(states) > batch_size:
+                break
 
-        if step % 10000 == 0:
-            avg_len = np.mean(episode_lengths) if episode_lengths else 0.0
-            print(f"Step: {step:6d}/{steps} | "
-                  f"Avg Ep Length: {avg_len:5.1f} steps ({avg_len * dt:4.2f}s) | "
-                  f"Best Time: {best_time:.2f}s | "
-                  f"Epsilon: {agent.epsilon:.3f}")
+            S_t, done, episode_rewards = get_random_state(), False, []
 
-    # Восстанавливаем лучшую модель, если она была найдена
-    if best_model_weights is not None:
-        agent.policy_net.load_state_dict(best_model_weights)
-        agent.target_net.load_state_dict(best_model_weights)
-        print(f"Обучение завершено. Восстановлена лучшая модель с результатом {best_time:.2f} сек.")
-    else:
-        print("Обучение завершено.")
+    agent.optimizer.zero_grad()
+
+    weights_tensor = torch.as_tensor(batch_weights, dtype=torch.float32).to(agent.device)
+    normalized_weights = (weights_tensor - weights_tensor.mean()) / (weights_tensor.std() + 1e-8)
+
+    batch_loss = agent.compute_loss(
+        obs=torch.as_tensor(states, dtype=torch.float32).to(agent.device),
+        act=torch.as_tensor(actions, dtype=torch.int32).to(agent.device),
+        weights=normalized_weights
+    )
+
+    batch_loss.backward()
+    agent.optimizer.step()
+
+    # --- ВОЗВРАЩАЕМ СРЕДНЮЮ ДЛИНУ РАУНДА В ЭТОМ БАТЧЕ ---
+    return batch_loss.item(), np.mean(episode_lengths)
 
 
 if __name__ == "__main__":
@@ -186,9 +176,13 @@ if __name__ == "__main__":
     target_update_counter = 0
 
     # Выбор режима: "PID" или "RL"
-    CONTROL_MODE = "RL"
+    CONTROL_MODE = "PID"
 
-    pretrain_agent(rl_agent, sol)
+    if CONTROL_MODE == "RL":
+        print('Pretrain 100 epoches with batch_size=10')
+        for epoch in range(100):
+            print(f'Run epoch {epoch}')
+            loss, R = pretrain_agent_one_batch(rl_agent, sol)
 
     # Выставляем начальные условия
     X[2] -= 0.1  # Начальный небольшой наклон
@@ -227,6 +221,7 @@ if __name__ == "__main__":
             u = rl_agent.get_action(current_state)
 
         # --- ФИЗИКА (Передаем вычисленное u в движок) ---
+        u = np.clip(u, a_min=-200, a_max=200) # ограничим амплитуду силы
         X = sol.step(X, u)
 
         # --- ОНЛАЙН-ОБУЧЕНИЕ (Только в режиме RL) ---
