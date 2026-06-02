@@ -5,6 +5,7 @@ import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.linalg import solve_continuous_are
 import matplotlib.pyplot as plt
+from torch.distributed.elastic import agent
 from pid import PID
 from ppo import OnlineRLController
 import copy
@@ -20,12 +21,6 @@ M = 10
 g = 9.8
 p_length = 100
 l = p_length
-
-# Initial state (example values)
-# X | dX/dt | T | dT/dt
-X = np.zeros(4)
-X[2] -= 0.1
-X[0] += 70
 
 def transform(x: int, y: int):
     return x + W//2, 0.9*H - y
@@ -110,39 +105,61 @@ def get_random_state():
                     np.random.uniform(-10.0, 10.0),
                     np.random.uniform(-0.3, 0.3),
                     np.random.uniform(-0.3, 0.3)])
+    S_0 = np.array([70.0, 0, -0.2, 0])
     return S_0
 
 # for training policy
-def pretrain_agent_one_batch(agent, solution, batch_size: int=32):
+def pretrain_agent_one_batch(agent, solution, batch_size: int = 8000):
+    episode_num = 0
+
     batch_weights = []
-    episode_lengths = []  # --- ТЕПЕРЬ СЛЕДИМ ЗА ДЛИНОЙ РАУНДОВ ---
+    episode_lengths = []
 
     S_t, done, states, actions, episode_rewards = get_random_state(), False, [], [], []
 
     while True:
+        # 1. Запоминаем состояние в тот момент, когда сеть РЕАЛЬНО принимает решение
         states.append(S_t)
 
+        # 2. Агент выбирает действие
         a_t = agent.get_action(torch.as_tensor(S_t, dtype=torch.float32).to(agent.device))
         actions.append(a_t)
+        force = agent.action_space[a_t]
 
-        S_t = solution.step(S_t, a_t)
-        r_t, done = agent.compute_reward(S_t)
-        episode_rewards.append(r_t)
+        # 3. --- МЕХАНИЗМ FRAME SKIPPING (УДЕРЖАНИЕ ДЕЙСТВИЯ) ---
+        # Применяем выбранную силу в течение 4 шагов симулятора подряд
+        accumulated_reward = 0
+        for _ in range(4):
+            S_t = solution.step(S_t, force)
+            r_t, done = agent.compute_reward(S_t)
+            accumulated_reward += r_t
+            if done:
+                break  # Если упал посреди макро-шага, прерываемся
+
+        # Сохраняем суммарную награду, полученную за время удержания этой силы
+        episode_rewards.append(accumulated_reward)
 
         if done:
-            # Длина этого раунда — это просто количество шагов в episode_rewards
+            episode_num += 1
+
             episode_lengths.append(len(episode_rewards))
 
-            R = np.array(episode_rewards)
-            batch_weights += (R.sum() + R - np.cumsum(R)).tolist()
+            # Дисконтированный Reward-to-go
+            discounted_reward = 0
+            episode_weights = []
+            for r in reversed(episode_rewards):
+                discounted_reward = r + agent.gamma * discounted_reward
+                episode_weights.insert(0, discounted_reward)
+
+            batch_weights += episode_weights
 
             if len(states) > batch_size:
                 break
 
             S_t, done, episode_rewards = get_random_state(), False, []
 
+    # Обучение сети (код остается без изменений)
     agent.optimizer.zero_grad()
-
     weights_tensor = torch.as_tensor(batch_weights, dtype=torch.float32).to(agent.device)
     normalized_weights = (weights_tensor - weights_tensor.mean()) / (weights_tensor.std() + 1e-8)
 
@@ -151,12 +168,10 @@ def pretrain_agent_one_batch(agent, solution, batch_size: int=32):
         act=torch.as_tensor(actions, dtype=torch.int32).to(agent.device),
         weights=normalized_weights
     )
-
     batch_loss.backward()
     agent.optimizer.step()
 
-    # --- ВОЗВРАЩАЕМ СРЕДНЮЮ ДЛИНУ РАУНДА В ЭТОМ БАТЧЕ ---
-    return batch_loss.item(), np.mean(episode_lengths)
+    return batch_loss.item(), np.mean(episode_lengths), episode_num
 
 
 if __name__ == "__main__":
@@ -172,25 +187,32 @@ if __name__ == "__main__":
 
     # 3. Инициализируем RL-агент онлайн-обучения
     # state_dim=4 (x, dx, theta, dtheta), action_dim=3 (влево, стоп, вправо)
-    rl_agent = OnlineRLController(state_dim=4)
+    rl_agent = OnlineRLController(state_dim=4, lr=1e-4)
     target_update_counter = 0
 
     # Выбор режима: "PID" или "RL"
-    CONTROL_MODE = "PID"
+    CONTROL_MODE = "RL"
 
     if CONTROL_MODE == "RL":
-        print('Pretrain 100 epoches with batch_size=10')
-        for epoch in range(100):
-            print(f'Run epoch {epoch}')
-            loss, R = pretrain_agent_one_batch(rl_agent, sol)
+        print('Pretrain 100 batches with batch_size=10')
+        for batch in range(10):
+            loss, batch_len, ep_num = pretrain_agent_one_batch(rl_agent, sol, batch_size=1000)
+            print(f'Batch {batch} len {batch_len:.2f} ep_num {ep_num}')
 
     # Выставляем начальные условия
-    X[2] -= 0.1  # Начальный небольшой наклон
-    X[0] += 70  # Смещение
+    # Initial state (example values)
+    # X | dX/dt | T | dT/dt
+    S_0 = np.array([70.0, 0, -0.2, 0])
 
     cnt = 0
     running = True
+
+    S_t = np.copy(S_0)
+
     while running:
+        if abs(S_t[0]) > 300:
+            S_t = np.copy(S_0)
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -203,57 +225,34 @@ if __name__ == "__main__":
 
         # --- СБОР ТЕКУЩЕГО СОСТОЯНИЯ ---
         # Запоминаем текущее состояние перед шагом физики (нужно для RL)
-        current_state = np.copy(X)
-        x, dx, theta, dtheta = current_state
+        x, dx, theta, dtheta = S_t
 
         # --- КОНТРОЛЛЕР (Внешний уровень управления) ---
         if CONTROL_MODE == "PID":
             # Внешний контур PID: позиция тележки -> желаемый угол
             theta_ref_raw = pid_x.step(x_ref - x, dt)
             theta_max = 0.2
-            theta_ref = 0  # np.tanh(theta_ref_raw / theta_max) * theta_max
+            theta_ref = 0 # np.tanh(theta_ref_raw / theta_max) * theta_max
 
             # Внутренний контур PID: угол -> необходимая сила u
             u = pid.step(theta - theta_ref, dt)
 
         elif CONTROL_MODE == "RL":
             # Нейросеть выбирает силу u на основе текущего состояния X
-            u = rl_agent.get_action(current_state)
+            u = rl_agent.action_space[rl_agent.get_action(torch.as_tensor(S_t, dtype=torch.float32))]
 
         # --- ФИЗИКА (Передаем вычисленное u в движок) ---
-        u = np.clip(u, a_min=-200, a_max=200) # ограничим амплитуду силы
-        X = sol.step(X, u)
-
-        # --- ОНЛАЙН-ОБУЧЕНИЕ (Только в режиме RL) ---
-        if CONTROL_MODE == "RL":
-            # Передаем НОВОЕ состояние в агент для расчета награды и шага оптимизации сети
-            done, reward = rl_agent.train_step(X)
-
-            # Периодически синхронизируем Target-сеть DQN для стабильности
-            target_update_counter += 1
-            if target_update_counter % 10 == 0:
-                rl_agent.update_target_network()
-
-            # Если маятник упал или улетел за экран — сбрасываем среду
-            if done:
-                X = np.zeros(4)
-                X[2] -= 0.1  # Начальный небольшой наклон
-                X[0] += 70  # Смещение
-                rl_agent.last_state = None  # Сбрасываем историю шага агента
-                pid.reset()  # На всякий случай сбрасываем интеграторы PID
-                pid_x.reset()
+        u = np.clip(u, a_min=-100, a_max=100) # ограничим амплитуду силы
+        S_t = sol.step(S_t, u)
 
         # --- ОТРИСОВКА ---
         screen.fill((255, 255, 255))
-        stuff.draw(screen, X)
+        stuff.draw(screen, S_t)
 
         # Вывод отладочной информации на экран
         cnt += 1
         if cnt % FPS == 0:
-            info_str = f"Mode: {CONTROL_MODE} | Angle: {X[2]:.2f} | Force U: {u:.2f}"
-            if CONTROL_MODE == "RL":
-                info_str += f" | Eps: {rl_agent.epsilon:.2f} | Rew: {reward:.1f}"
-            print(info_str)
+            print(f"Mode: {CONTROL_MODE} | Angle: {S_t[2]:.2f} | Force U: {u:.2f}", S_t.round(2))
 
         pygame.display.flip()
         clock.tick(FPS)
