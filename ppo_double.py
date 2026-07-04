@@ -57,12 +57,11 @@ class PolicyNetwork(nn.Module):
         return action, log_prob
 
     def get_deterministic_action(self, state):
-        """
-        Используется во время ДЕМОНСТРАЦИИ (после обучения).
-        Игнорирует шум и выдает строго лучшее среднее значение.
-        """
-        mu, _ = self.forward(state)
-        return torch.clamp(mu, -1.0, 1.0)
+        # Превращаем в тензор, так как Gymnasium возвращает numpy-массив
+        state_t = torch.tensor(state, dtype=torch.float32)
+        with torch.no_grad():
+            mu, _ = self.forward(state_t)
+        return torch.clamp(mu, -1.0, 1.0).numpy()
 
 
 # --- 2. Логика PPO Агента ---
@@ -84,19 +83,27 @@ class PPOAgent:
         return returns
 
     def update_policy(self, states, actions, rewards, old_log_probs):
+        # Переводим данные в тензоры нужных типов
         states_t = torch.tensor(np.array(states), dtype=torch.float32)
-        actions_t = torch.tensor(np.array(actions), dtype=torch.float32)
+        actions_t = torch.tensor(np.array(actions), dtype=torch.float32).view(-1, 1)  # float32 и правильная размерность
         old_log_probs_t = torch.tensor(np.array(old_log_probs), dtype=torch.float32)
 
         returns = self.compute_returns(rewards)
         advantages_t = torch.tensor(returns, dtype=torch.float32)
 
-        new_probs = self.policy(states_t)
-        chosen_probs = new_probs.gather(1, actions_t.unsqueeze(1)).squeeze(1)
+        # ИСПРАВЛЕНО: Считаем НОВЫЕ логарифмы вероятностей для старых действий
+        mu, sigma = self.policy(states_t)
+        new_dist = Normal(mu, sigma)
+        new_log_probs = new_dist.log_prob(actions_t).sum(dim=-1)
 
-        ratio = chosen_probs / old_probs_t
+        # ИСПРАВЛЕНО: Для логарифмов отношение вероятностей считается через экспоненту разности!
+        ratio = torch.exp(new_log_probs - old_log_probs_t)
+
+        # Считаем суррогатные лоссы PPO
         surr1 = ratio * advantages_t
         surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages_t
+
+        # Финальный лосс PPO (добавим минус, так как мы максимизируем награду через градиентный спуск)
         loss = -torch.mean(torch.min(surr1, surr2))
 
         self.optimizer.zero_grad()
@@ -150,15 +157,16 @@ def train_agent():
     return agent
 
 def run_double_pendulum_demo(agent):
-    # Загружаем индустриальный движок MuJoCo для двойного маятника
+    print("\nЗапуск демонстрации обученного агента...")
     env = gym.make("InvertedDoublePendulum-v5", render_mode="human")
     observation, info = env.reset()
 
     for _ in range(1000):
+        # Используем детерминированное (лучшее среднее) действие без шума
         action = agent.policy.get_deterministic_action(observation)
         observation, reward, terminated, truncated, info = env.step(action)
 
-        time.sleep(0.5)
+        time.sleep(0.02) # ИСПРАВЛЕНО: 0.02 секунды для реалистичной физики 50 Гц
 
         if terminated or truncated:
             print("Система потеряла баланс, перезапуск...")
